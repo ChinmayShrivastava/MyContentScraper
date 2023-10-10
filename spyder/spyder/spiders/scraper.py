@@ -9,9 +9,14 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+import json
+import time
 
 chrome_options = Options()
 chrome_options.add_argument('--headless')
+# resolution = "1920,1080"
+# chrome_options.add_argument("--window-size=%s" % resolution)
 driver = webdriver.Chrome('chromedriver', options=chrome_options)
 
 # checks if an element contains any anchors, returns a list of links and the associated text
@@ -37,7 +42,7 @@ def anchorcheck(element):
     else:
         return None
 
-def contentfinder(url, driver, TIMEOUT=10):
+def contentfinder(url, driver=driver, TIMEOUT=10):
 
     ## should be set up in the main script
     # ==========
@@ -60,8 +65,7 @@ def contentfinder(url, driver, TIMEOUT=10):
             #driver = webdriver.Chrome()
             driver.get(url)
             html = driver.page_source
-        else:
-            html = requests.get(url).text
+            soup = BeautifulSoup(html, "html.parser")
     except Exception:
         pass
 
@@ -85,8 +89,6 @@ def contentfinder(url, driver, TIMEOUT=10):
     if not article:
         doc = Document(response.text)
         article = BeautifulSoup(doc.summary(html_partial=True), "html.parser")
-    
-    driver.quit()
 
     # Returns the parsed article content
     return article, title, lang, soup
@@ -103,33 +105,43 @@ def contentfinder_takesinresponse(response, driver=driver, TIMEOUT=10):
     Returns:
         A tuple containing the parsed article content, the page title, the detected language, and the original BeautifulSoup object.
     """
-    soup = BeautifulSoup(response.text, "html.parser")
-    title = soup.title.string if soup.title else ""
-    lang = soup.html.get("lang", "")
 
-    # Try to find the main content using various methods
-    article = soup.find("article")
-    if not article:
-        article = soup.find("div", class_="article-body")
+    headers = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:55.0) Gecko/20100101 Firefox/55.0',
+    }
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Check if the page uses JavaScript
+    try:
+        if "javascript" in soup.find("html").get("class", []):
+            # Use Selenium to load the JavaScript content and get the page source
+            #driver = webdriver.Chrome()
+            driver.get(response.url)
+            html = driver.page_source
+            soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        pass
+
+    article = None
+    t = soup.find('title')
+    title = t.string if t is not None else None
+    lang = detect(soup.body.get_text())
+
+    # Look for the <article>, <div>, or <section> tags that contain the main article content
+    article = soup.find("article") or soup.find("div", class_="article") or soup.find("section", class_="article")
+
+    # If the <article>, <div>, or <section> tags are not found, look for elements with specific CSS classes
     if not article:
         article = soup.find("div", class_="entry-content") or soup.find("div", class_="main-content")
+
+    # If the <article>, <div>, or <section> tags are not found, look for the <main> tag
     if not article:
         article = soup.find("main")
+
+    # If the <article>, <div>, <section>, or <main> tags are not found, use a content extraction library
     if not article:
         doc = Document(response.text)
         article = BeautifulSoup(doc.summary(html_partial=True), "html.parser")
-
-    # If the main content is not found, try to wait for it to load using the Selenium webdriver
-    if not article:
-        try:
-            WebDriverWait(driver, TIMEOUT).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            article = soup.find("article")
-        except TimeoutException:
-            pass
-
-    # Quit the webdriver
-    driver.quit()
 
     # Returns the parsed article content
     return article, title, lang
@@ -137,6 +149,7 @@ def contentfinder_takesinresponse(response, driver=driver, TIMEOUT=10):
 def urlcheck(url, host=None):
     # host = get_host_and_path(url)[0]
     url = normalize_url(url)
+    i=0
     while True:
         if is_not_crawlable(url):
             return None
@@ -145,7 +158,10 @@ def urlcheck(url, host=None):
         elif validate_url(url)[0]:
             return url
         else:
+            if i > 1:
+                return None
             url = fix_relative_urls(host, url)
+            i+=1
             continue
 
 def traverse(soup):
@@ -165,7 +181,7 @@ def traverse(soup):
 
 def article_to_tree(article, url, title):
 
-    #print(article.prettify())
+    # print(article.prettify())
 
     # expects a soup object or None
     if article is None: return
@@ -203,12 +219,6 @@ def heading_paragraph_tree(headings, paragraphs, parents, elements):
         parents = [0]
         heading_paragraph_tree(headings, paragraphs, parents, elements[1:])
         return
-
-    if elements[0]['name'] in ['p', 'ul', 'ol', 'li', 'span']:
-        paragraphs.append([0, elements[0]['name'], elements[0]['content'], []])
-        headings[parents[0]][5].append(len(paragraphs)-1)
-        heading_paragraph_tree(headings, paragraphs, parents, elements[1:])
-        return
     
     if elements[0]['name'] in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
         # compare tag to parent tags, until equivalent or greater, then, 
@@ -227,6 +237,12 @@ def heading_paragraph_tree(headings, paragraphs, parents, elements):
                 previous = headings[previous][4]
             headings[previous][4] = len(headings)-1
         parents = [len(headings)-1] + parents
+        heading_paragraph_tree(headings, paragraphs, parents, elements[1:])
+        return
+
+    if elements[0]['name'] in ['p', 'ul', 'ol', 'li', 'span']:
+        paragraphs.append([0, elements[0]['name'], elements[0]['content'], []])
+        headings[parents[0]][5].append(len(paragraphs)-1)
         heading_paragraph_tree(headings, paragraphs, parents, elements[1:])
         return
     
@@ -263,7 +279,13 @@ def collapse(dom_dictionary):
 
     dom_dictionary['children'] = children
 
-    if len(dom_dictionary['children']) == 1: 
+    if len(dom_dictionary['children']) == 1:
+        if dom_dictionary['name'] in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            return {
+                'name': dom_dictionary['name'],
+                'children': [],
+                'content': dom_dictionary['children'][0]['content']
+            }
         return dom_dictionary['children'][0]
 
     return dom_dictionary
@@ -294,16 +316,18 @@ def join(dom_dictionary):
         children.append(join(child))
 
     if all(map(lambda x: x['name'] == '' and not is_empty(x['content']), children)) and len(children) != 0:
+
         for child in children:
             dom_dictionary['content'] += child['content']
         dom_dictionary['children'] = []
         return dom_dictionary
     
     else:
+
         dom_dictionary['children'] = []
         joining = False
         for child in children:
-            if child['name'] != '': 
+            if child['name'] != '':
                 joining = False
                 dom_dictionary['children'].append(child)
                 continue
@@ -371,10 +395,72 @@ def scrape_url(url, driver=driver, TIMEOUT=10):
         url_ = urlcheck(anchor[1], host)
         if url_: urls.append([anchor[0], url_])
 
-    try: 
-        res = article_to_tree(soup, url, title)
+    try:
+        doc, head, para = article_to_tree(soup, url, title)
     except Exception:
         print(f'failure to scrape {url}')
-        return urls, ([], [], [])
+        # return urls, ([], [], [])
+        return [], soup
     
-    return urls, res #soup_scraper(soup)
+    res = []
+
+    for heading in head:
+        paras = heading[-1]
+        text = []
+        for paragraph in paras:
+            text.append(para[paragraph][2])
+        text = '\n'.join(text)
+        res.append([doc[1]] + heading[1:5] + [text])
+
+    # return urls, res #soup_scraper(soup)
+    return res, soup
+
+# if __name__ == '__main__':
+
+#     url = 'https://www.rubrik.com/blog/technology/23/9/product-quality-at-rubrik-part-1'
+#     print(scrape_url(url)[0])
+    # driver.get(url)
+    # dict_ = {}
+
+    # while True:
+    #     try:
+    #         element = WebDriverWait(driver, 10).until(
+    #             EC.presence_of_element_located((By.ID, 'loadMore'))
+    #         )
+    #         break
+    #     except TimeoutException:
+    #         print('retrying')
+
+    # while True:
+    #     i = 0
+    #     links = driver.find_elements(By.XPATH, "//a[@href]")
+    #     for link in links:
+    #         if 'blog/' in link.get_attribute("href"):
+    #             i+=1
+    #             dict_[link.get_attribute("href")] = True
+    #     print(len(dict_))
+    #     if i == 0:
+    #         # export to rubrik.json
+    #         with open('rubrik.json', 'w') as f:
+    #             json.dump(dict_, f)
+    #         break
+
+    #     # input('press enter to continue')
+
+    #     try:
+    #         click = driver.find_element(By.XPATH, "//button[@id='loadMore']")
+    #         # scroll to the button
+    #         driver.execute_script("arguments[0].click();", click)
+    #     except Exception:
+    #         # export to rubrik.json
+    #         with open('rubrik.json', 'w') as f:
+    #             json.dump(dict_, f)
+    #         break
+
+    #     # this shouldn't be used because it defeats the purpose of automation, but for now it's fine
+    #     time.sleep(2)
+
+    #     # links = driver.find_elements(By.XPATH, "//a[@href]")
+    #     # for link in links:
+    #     #     if 'blog/' in link.get_attribute("href"):
+    #     #         print(link.get_attribute("href"))
